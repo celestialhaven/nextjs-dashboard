@@ -4,6 +4,9 @@ import { z } from 'zod';
 import { revalidatePath } from 'next/cache';
 import { redirect } from 'next/navigation';
 import postgres from 'postgres';
+import { signIn } from '@/auth';
+import { AuthError } from 'next-auth';
+import bcrypt from 'bcrypt';
 
 const sql = postgres(process.env.POSTGRES_URL!, { ssl: 'require' });
 
@@ -34,6 +37,73 @@ export type State = {
   };
   message?: string | null;
 };
+
+const SignupSchema = z
+  .object({
+    name: z.string().trim().min(2, 'Name must be at least 2 characters.'),
+    email: z.string().trim().email('Enter a valid email address.'),
+    password: z.string().min(6, 'Password must be at least 6 characters.'),
+    confirmPassword: z.string(),
+  })
+  .refine((data) => data.password === data.confirmPassword, {
+    message: 'Passwords do not match.',
+    path: ['confirmPassword'],
+  });
+
+export type SignupState = {
+  errors?: {
+    name?: string[];
+    email?: string[];
+    password?: string[];
+    confirmPassword?: string[];
+  };
+  message?: string;
+};
+
+export async function createAccount(
+  prevState: SignupState,
+  formData: FormData,
+): Promise<SignupState> {
+  const validatedFields = SignupSchema.safeParse({
+    name: formData.get('name'),
+    email: formData.get('email'),
+    password: formData.get('password'),
+    confirmPassword: formData.get('confirmPassword'),
+  });
+
+  if (!validatedFields.success) {
+    return {
+      errors: validatedFields.error.flatten().fieldErrors,
+      message: 'Please correct the highlighted fields.',
+    };
+  }
+
+  const { name, email, password } = validatedFields.data;
+
+  try {
+    const existingUser = await sql`
+      SELECT id FROM users WHERE LOWER(email) = LOWER(${email}) LIMIT 1
+    `;
+
+    if (existingUser.length > 0) {
+      return {
+        errors: { email: ['An account with this email already exists.'] },
+        message: 'Unable to create account.',
+      };
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+    await sql`
+      INSERT INTO users (name, email, password)
+      VALUES (${name}, ${email.toLowerCase()}, ${hashedPassword})
+    `;
+  } catch (error) {
+    console.error('Failed to create account:', error);
+    return { message: 'Database error: Unable to create account.' };
+  }
+
+  redirect('/login?registered=1');
+}
  
 export async function createInvoice(prevState: State, formData: FormData) {
   // Validate form using Zod
@@ -115,5 +185,24 @@ export async function deleteInvoice(id: string) {
   // Unreachable code block
   await sql`DELETE FROM invoices WHERE id = ${id}`;
   revalidatePath('/dashboard/invoices');
+}
+
+export async function authenticate(
+  prevState: string | undefined,
+  formData: FormData,
+) {
+  try {
+    await signIn('credentials', formData);
+  } catch (error) {
+    if (error instanceof AuthError) {
+      switch (error.type) {
+        case 'CredentialsSignin':
+          return 'Invalid credentials.';
+        default:
+          return 'Something went wrong.';
+      }
+    }
+    throw error;
+  }
 }
 
